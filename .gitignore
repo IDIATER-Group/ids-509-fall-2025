@@ -1,37 +1,32 @@
-﻿# Python
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-*.log
-
-# Virtual envs
+﻿# Ignore virtual environment
 .venv/
 venv/
 env/
 
-# OS/editor trash
+# Ignore Streamlit configs & caches
+.streamlit/
+.streamlit/secrets.toml
+
+# Ignore Python cache & compiled files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Ignore databases and logs
+*.db
+*.sqlite
+*.sqlite3
+*.log
+
+# Ignore OS/editor files
 .DS_Store
 Thumbs.db
 .vscode/
 .idea/
 
-# Streamlit & local app artifacts
-.streamlit/
-.streamlit/secrets.toml
-.streamlit/*.lock
-
-# Databases & local state
-*.db
-game.db
-*.sqlite
-*.sqlite3
-
-# Secrets
+# Ignore secrets
 .env
 .env.*
 *.key
 *.pem
-
-# Node (if any)
-node_modules/
