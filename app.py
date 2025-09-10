@@ -204,7 +204,6 @@ def show_auth_page():
                             'last_result': None,
                             'generated_sql': '',
                             'current_sql': '',
-                            'current_prompt': '',
                             'sql_quality': None,
                             'last_prompt': '',
                             'last_sql_explanation': '',
@@ -270,7 +269,7 @@ def show_student_view():
         with col1:
             st.write(f'👋 Welcome, {st.session_state.full_name or st.session_state.username}!')
         with col2:
-            if st.button('🚪 Logout', key='logout_button', use_container_width=True):
+            if st.button('🚪 Logout', key='logout_button'):
                 for key in list(st.session_state.keys()):
                     del st.session_state[key]
                 st.rerun()
@@ -564,7 +563,7 @@ def show_student_view():
                     # Show the query result in a clean format
                     try:
                         if isinstance(result, pd.DataFrame):
-                            st.dataframe(result)
+                            st.dataframe(result, width='stretch')
                         else:
                             st.code(str(result))
                     except Exception as e:
@@ -750,10 +749,10 @@ def show_instructor_view():
             conn.close()
             
         st.markdown("---")
-        if st.button('🔄 Refresh Data', use_container_width=True):
+        if st.button('🔄 Refresh Data'):
             st.rerun()
             
-        if st.button('🚪 Logout', type='primary', use_container_width=True):
+        if st.button('🚪 Logout', type='primary'):
             for key in list(st.session_state.keys()):
                 del st.session_state[key]
             st.rerun()
@@ -815,7 +814,7 @@ def show_instructor_view():
                 'Last Active': 'Last Active'
             },
             hide_index=True,
-            use_container_width=True
+            width='stretch'
         )
         
         # Student selection for detailed view
@@ -958,10 +957,10 @@ if st.session_state.role == 'admin':
         st.write('---')
         
         # Navigation options
-        st.button('Dashboard', use_container_width=True, disabled=True)
+        st.button('Dashboard', disabled=True)
         
         # Logout button
-        if st.button('Logout', use_container_width=True, key='admin_logout'):
+        if st.button('Logout', key='admin_logout'):
             for key in list(st.session_state.keys()):
                 del st.session_state[key]
             st.rerun()
@@ -985,7 +984,7 @@ if st.session_state.role == 'admin':
                 ORDER BY role, username
             ''', conn)
             
-            st.dataframe(users_df, use_container_width=True)
+            st.dataframe(users_df, width='stretch')
             
             # Add new user form
             with st.expander('Add New User'):
@@ -1072,7 +1071,7 @@ if st.session_state.role == 'admin':
             ''', conn)
             
             if not logs.empty:
-                st.dataframe(logs, use_container_width=True)
+                st.dataframe(logs, width='stretch')
             else:
                 st.info('No activity logs found')
                 
