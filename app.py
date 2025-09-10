@@ -919,7 +919,7 @@ def show_student_details(conn, student_id):
                         
                         # Show attempts for this scene
                         c.execute('''
-                            SELECT timestamp, score, hints_used, feedback
+                            SELECT timestamp, score, hint_used, feedback
                             FROM logs
                             WHERE student_id = ? AND scene_id = ?
                             ORDER BY timestamp DESC
@@ -927,7 +927,7 @@ def show_student_details(conn, student_id):
                         
                         attempts = c.fetchall()
                         for attempt in attempts:
-                            timestamp, score, hints_used, feedback = attempt
+                            timestamp, score, hint_used, feedback = attempt
                             with st.container(border=True):
                                 st.write(f"**{timestamp}** - Score: {score}%")
                                 st.write(f"Hints used: {hints_used}")
