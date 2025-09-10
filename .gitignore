@@ -1,0 +1,37 @@
+﻿# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# OS/editor trash
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Streamlit & local app artifacts
+.streamlit/
+.streamlit/secrets.toml
+.streamlit/*.lock
+
+# Databases & local state
+*.db
+game.db
+*.sqlite
+*.sqlite3
+
+# Secrets
+.env
+.env.*
+*.key
+*.pem
+
+# Node (if any)
+node_modules/

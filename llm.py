@@ -1,11 +1,9 @@
-import requests
 import sqlite3
 import time
 from datetime import datetime
 from db import get_connection
+from llm_providers import generate_text
 
-OLLAMA_URL = "http://localhost:11434/api/generate"  # Default Ollama endpoint
-LLAMA_MODEL = "llama3"  # Change to your model name if needed
 
 def ensure_llm_logs_table(conn):
     """Ensure the llm_logs table exists in the given connection"""
@@ -22,14 +20,14 @@ def ensure_llm_logs_table(conn):
     )''')
     conn.commit()
 
-def log_llm_interaction(conn, prompt, response, model=LLAMA_MODEL, user_id=None, tokens_used=None):
+def log_llm_interaction(conn, prompt, response, model="gemini-flash", user_id=None, tokens_used=None):
     """Log an interaction with the LLM
     
     Args:
         conn: Database connection
         prompt: The prompt sent to the LLM
         response: The response received from the LLM
-        model: The LLM model used (default: LLAMA_MODEL)
+        model: The LLM model used (default: "gemini-flash")
         user_id: ID of the user making the request (optional)
         tokens_used: Number of tokens used in the interaction (optional)
     """
@@ -190,136 +188,14 @@ def filter_suspicious_content(prompt, response):
         return "I'm sorry, I can't provide that information. Let's focus on learning SQL!"
     return response
 
-def call_ollama(prompt, model=LLAMA_MODEL, max_tokens=256, user_id=None):
-    """Call the Ollama API with safety checks and logging
-    
-    Args:
-        prompt: The prompt to send to the LLM
-        model: The model to use (default: LLAMA_MODEL)
-        max_tokens: Maximum number of tokens to generate (default: 256)
-        user_id: ID of the user making the request (required for rate limiting)
-        
-    Returns:
-        str: The generated response, or None if an error occurred
-    """
-    conn = get_connection()
-    response_text = None
-    error_msg = "An unknown error occurred"
-    tokens_used = 0  # Initialize tokens_used with a default value
-    
-    try:
-        # Rate limiting check
-        allowed, message = check_rate_limit(conn, user_id)
-        if not allowed:
-            return message or "Rate limit exceeded. Please wait before making more requests."
-        
-        # Prepare the payload with safety parameters
-        payload = {
-            "model": model,
-            "prompt": prompt,
-            "max_tokens": min(max_tokens, 512),  # Enforce max token limit
-            "temperature": 0.7,  # Lower temperature for more focused responses
-            "top_p": 0.9,  # Nucleus sampling for better quality
-            "repeat_penalty": 1.1,  # Slightly discourage repetition
-            "stop": ["\n\n"],  # Stop on double newlines
-            "stream": False  # Ensure we get a complete response
-        }
-        
-        print(f"Sending request to Ollama API at {OLLAMA_URL} with model {model}")
-        print(f"Payload: {payload}")
-        
-        # Make the API call with timeout
-        start_time = time.time()
-        try:
-            response = requests.post(
-                OLLAMA_URL, 
-                json=payload, 
-                timeout=30,
-                headers={
-                    'Content-Type': 'application/json',
-                    'User-Agent': 'SQL-Mystery-Game/1.0'
-                }
-            )
-            response_time = time.time() - start_time
-            print(f"Ollama API response status: {response.status_code} (took {response_time:.2f}s)")
-            
-            # Log raw response for debugging
-            print(f"Raw response: {response.text[:500]}..." if len(response.text) > 500 else f"Raw response: {response.text}")
-            
-            response.raise_for_status()
-            
-            # Extract and clean the response
-            data = response.json()
-            print(f"Raw API response: {data}")  # Debug print
-            
-            # Handle both streaming and non-streaming response formats
-            if 'response' in data:
-                response_text = data['response'].strip()
-                tokens_used = data.get('eval_count', 0)
-            else:
-                response_text = data.get('choices', [{}])[0].get('text', '').strip()
-                tokens_used = data.get('usage', {}).get('total_tokens', 0)
-            
-            print(f"Ollama API response: {response_text[:200]}...")
-            
-            if not response_text:
-                print("Warning: Empty response from Ollama API")
-                response_text = "-- No response from the AI assistant. Please try again."
-            else:
-                # Apply content filtering only if we have a response
-                response_text = filter_suspicious_content(prompt, response_text)
-                
-        except requests.exceptions.RequestException as e:
-            error_msg = f"API request failed: {str(e)}"
-            print(f"Error: {error_msg}")
-            raise
-            
-        except ValueError as e:
-            error_msg = f"Invalid response format: {str(e)}"
-            print(f"Error: {error_msg}")
-            raise
-            
-        except Exception as e:
-            error_msg = f"Unexpected error: {str(e)}"
-            print(f"Error: {error_msg}")
-            raise
-            
-        # Log the successful interaction
-        log_llm_interaction(
-            conn=conn,
-            prompt=prompt,
-            response=response_text,
-            model=model,
-            user_id=user_id,
-            tokens_used=tokens_used
-        )
-        
-        return response_text
-        
-    except Exception as e:
-        # Log the error
-        log_llm_interaction(
-            conn=conn,
-            prompt=prompt,
-            response=f"Error: {error_msg}",
-            model=model,
-            user_id=user_id,
-            tokens_used=0
-        )
-        return f"I encountered an error while processing your request: {error_msg}"
-        
-    finally:
-        conn.close()
 
 def generate_sql(scene, quality='correct', user_id=None):
     """
-    Generate SQL using local Llama (Ollama) with logging.
-    
+    Generate SQL using Gemini Flash via AI Studio.
     Args:
         scene: The scene dictionary containing title, story, question, etc.
         quality: The quality of SQL to generate ('correct', 'partial', 'incorrect')
         user_id: ID of the user making the request (optional)
-    
     Returns:
         str: Generated SQL query
     """
@@ -327,101 +203,38 @@ def generate_sql(scene, quality='correct', user_id=None):
     print(f"Scene: {scene.get('title', 'No title')}")
     print(f"Quality: {quality}")
     print(f"User ID: {user_id}")
-    
-    conn = None
+
     try:
-        # Get database connection for logging
-        conn = get_connection()
-        
-        print("\n1. Building prompt...")
         prompt = build_prompt(scene, quality)
         print(f"Prompt length: {len(prompt)} characters")
         print(f"Prompt preview: {prompt[:200]}...")
-        
-        print("\n2. Calling Ollama API...")
-        try:
-            print(f"\nCalling Ollama with prompt length: {len(prompt)} characters")
-            print(f"Prompt preview: {prompt[:200]}...")
-            
-            sql = call_ollama(prompt, user_id=user_id)
-            print(f"\nRaw Ollama response: {sql}")
-            
-            # Check if the response contains an error message from our error handling
-            if sql and isinstance(sql, str) and sql.startswith("I encountered an error"):
-                print("\n⚠️ Error response from Ollama API")
-                raise Exception(f"API Error: {sql}")
-                
-            if not sql or not sql.strip():
-                print("\n⚠️ Empty response from Ollama API")
-                raise Exception("Received empty response from Ollama API")
-            
-            # Initialize explanatory text
-            explanation = ""
-            cleaned_sql = sql.strip()
-            
-            # Extract explanation before the code block
-            if '```' in cleaned_sql:
-                parts = cleaned_sql.split('```')
-                explanation = parts[0].strip()
-                if len(parts) > 1:
-                    # Get the SQL part (inside the code block)
-                    sql_part = parts[1]
-                    if sql_part.startswith('sql\n'):
-                        sql_part = sql_part[4:]  # Remove 'sql\n' prefix
-                    cleaned_sql = sql_part.strip()
-            
-            # If there's no code block but there's explanatory text
-            elif 'SELECT ' in cleaned_sql:
-                # Try to separate explanation from SQL
-                sql_start = cleaned_sql.find('SELECT ')
-                if sql_start > 0:
-                    explanation = cleaned_sql[:sql_start].strip()
-                    cleaned_sql = cleaned_sql[sql_start:].strip()
-            
-            # Store explanation in session state if available
-            if explanation:
-                st.session_state.last_sql_explanation = explanation
-            
-            print("\n✅ Successfully generated and cleaned SQL from Ollama")
-            print(f"Explanation: {explanation}")
-            print(f"Cleaned SQL: {cleaned_sql}")
-            return cleaned_sql
-                
-        except Exception as e:
-            print(f"\n⚠️ Error calling Ollama API: {str(e)}")
-            print("Falling back to mock SQL generation...")
-            raise  # Re-raise to be caught by outer exception handler
-            
+
+        # Use Gemini Flash for SQL generation
+        sql = generate_text(prompt, temperature=0.0)
+        print(f"\nRaw Gemini response: {sql}")
+
+        # Clean up the response (remove code fences, explanations, etc.)
+        cleaned_sql = sql.strip()
+        if '```' in cleaned_sql:
+            parts = cleaned_sql.split('```')
+            if len(parts) > 1:
+                sql_part = parts[1]
+                if sql_part.startswith('sql\n'):
+                    sql_part = sql_part[4:]
+                cleaned_sql = sql_part.strip()
+        elif 'SELECT ' in cleaned_sql:
+            sql_start = cleaned_sql.find('SELECT ')
+            cleaned_sql = cleaned_sql[sql_start:].strip()
+
+        print("\n✅ Successfully generated and cleaned SQL from Gemini")
+        print(f"Cleaned SQL: {cleaned_sql}")
+        return cleaned_sql
+
     except Exception as e:
-        import traceback
-        print("\n❌ Error in generate_sql:")
-        traceback.print_exc()
-        print("\n⚠️ Falling back to mock SQL due to error")
+        print(f"\n❌ Error in generate_sql: {str(e)}")
         mock_sql = get_mock_sql(scene, quality)
         print(f"Generated mock SQL: {mock_sql}")
-        
-        # Log the error
-        if conn:
-            try:
-                log_llm_interaction(
-                    conn=conn,
-                    prompt=f"Error in generate_sql: {str(e)}\n\nOriginal prompt: {prompt}",
-                    response=f"Fell back to mock SQL: {mock_sql}",
-                    model="error",
-                    user_id=user_id
-                )
-            except Exception as log_error:
-                print(f"Failed to log error: {log_error}")
-            
         return mock_sql
-    
-    finally:
-        print("=== End of SQL Generation ===\n")
-        if conn:
-            try:
-                conn.close()
-            except:
-                pass
 
 def get_mock_sql(scene, quality):
     """Generate mock SQL for fallback purposes"""
@@ -459,14 +272,3 @@ def get_random_quality():
         return 'partial'
     else:
         return 'incorrect'
-        return sql
-    # Fallback to mock logic
-    if quality == 'correct':
-        return scene['answer_sql'].strip()
-    elif quality == 'partial':
-        if 'WHERE' in scene['answer_sql']:
-            return scene['answer_sql'].split('WHERE')[0] + 'WHERE 1=1;'
-        else:
-            return scene['answer_sql'].replace('JOIN', '-- JOIN')
-    else:
-        return 'SELECT * FROM suppliers;'
