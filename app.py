@@ -5,6 +5,11 @@ st.set_page_config(layout="wide", page_title="SQL Mystery Game")
 import sqlite3
 import pandas as pd
 import time
+import hashlib
+import re
+import unicodedata
+import sqlparse  # ensure in requirements
+
 from db import get_connection, setup_database
 from scenes import get_scenes
 from auth import setup_auth, register_user, verify_login
@@ -12,6 +17,30 @@ from evaluator import evaluate_sql
 from logs import setup_logs, log_attempt, get_logs
 from adaptive import adjust_difficulty
 from llm import generate_sql, get_random_quality
+
+# -------------------------------
+# Helpers for SQL normalization & read-only guard
+# -------------------------------
+_SQL_LINE_COMMENT = re.compile(r"--.*?$", re.MULTILINE)
+_SQL_BLOCK_COMMENT = re.compile(r"/\*.*?\*/", re.DOTALL)
+_ZERO_WIDTH = re.compile(r"[\u200B-\u200D\uFEFF]")
+
+def _strip_comments_and_weirdness(sql: str) -> str:
+    """Normalize unicode, remove zero-width chars, strip comments, collapse whitespace."""
+    if not isinstance(sql, str):
+        return ""
+    s = unicodedata.normalize("NFKC", sql)
+    s = _ZERO_WIDTH.sub("", s)
+    s = _SQL_BLOCK_COMMENT.sub("", s)
+    s = _SQL_LINE_COMMENT.sub("", s)
+    s = "\n".join(line.strip() for line in s.splitlines())
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def _first_statement(sql: str) -> str:
+    """Return only the first SQL statement (avoid multi-statement surprises)."""
+    parts = [p.strip() for p in sqlparse.split(sql or "") if p and p.strip()]
+    return parts[0] if parts else ""
 
 # -------------------------------
 # Game defaults + reset utilities
@@ -29,6 +58,8 @@ GAME_KEYS = {
     'current_prompt': '',
     'last_sql_explanation': '',
     'render_count': 0,
+    'last_scored_attempt': None,   # prevent double-scoring
+    'last_logged_attempt': None,   # prevent duplicate logs
 }
 
 def reset_game_state(keep_auth=True):
@@ -42,8 +73,31 @@ def reset_game_state(keep_auth=True):
     st.session_state.scenes = get_scenes()
     st.rerun()
 
+def reset_game_data_tables():
+    """
+    Drop & recreate the core game data tables (not users/logs),
+    then reseed canonical data so replay starts clean.
+    """
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.executescript("""
+            PRAGMA foreign_keys=OFF;
+            DROP TABLE IF EXISTS shipments;
+            DROP TABLE IF EXISTS inventory;
+            DROP TABLE IF EXISTS products;
+            DROP TABLE IF EXISTS suppliers;
+            DROP TABLE IF EXISTS warehouses;
+            PRAGMA foreign_keys=ON;
+        """)
+        conn.commit()
+        setup_database(conn)  # reseed canonical dataset
+    # Clear attempt tokens so next submit logs/scores again
+    st.session_state.last_scored_attempt = None
+    st.session_state.last_logged_attempt = None
+    st.success("Game data reset. Start again at Level 1.")
+    st.rerun()
+
 # --- Setup ---
-# Initialize database, logs, and auth
 def initialize_database():
     """Initialize all database components"""
     conn = get_connection()
@@ -93,14 +147,11 @@ def show_auth_page():
         login_password = st.text_input('Password', type='password', key='login_password_field')
         
         if st.button('Login', key='login_button'):
-            print(f"Attempting login for user: {login_username}")
             success, role, message = verify_login(login_username, login_password)
-            print(f"Login result - Success: {success}, Role: {role}, Message: {message}")
             if success: 
                 conn = get_connection()
                 try:
                     c = conn.cursor()
-                    # Get additional user info
                     c.execute('''
                         SELECT user_id, full_name, role 
                         FROM users 
@@ -117,7 +168,6 @@ def show_auth_page():
                         st.session_state.username = login_username
                         st.session_state.role = role
                         st.session_state.full_name = full_name or login_username
-                        print(f"User {login_username} logged in with role: {role}")
                         
                         # Initialize game state defaults if missing
                         for k, v in GAME_KEYS.items():
@@ -213,11 +263,19 @@ def init_game_state():
         st.session_state.scenes = get_scenes()
 
 def show_student_view():
-    # Initialize render count if it doesn't exist
+    # Ensure scenes exist
+    if 'scenes' not in st.session_state or not st.session_state.scenes:
+        st.session_state.scenes = get_scenes()
+
+    # Initialize counters/state
     if 'render_count' not in st.session_state:
         st.session_state.render_count = 0
     st.session_state.render_count += 1
-    
+
+    level = st.session_state.get('level', 0)
+    scenes = st.session_state.scenes
+    total_levels = len(scenes)
+
     # Sidebar
     with st.sidebar:
         col1, col2 = st.columns([3, 2])
@@ -228,7 +286,7 @@ def show_student_view():
                 for key in list(st.session_state.keys()):
                     del st.session_state[key]
                 st.rerun()
-        
+
         st.divider()
         st.subheader('📚 Database Schema')
         st.markdown('''
@@ -287,7 +345,11 @@ def show_student_view():
         )
         ```
         ''')
-        
+
+        st.subheader('🔄 Maintenance')
+        if st.button("🔄 Reset Game Data", help="Recreate core game tables and reseed them. Keeps users & logs."):
+            reset_game_data_tables()
+
         st.subheader('🔎 Investigation Tips')
         st.markdown('''
         1. Start by examining basic inventory records
@@ -297,8 +359,8 @@ def show_student_view():
         5. Look for patterns in dates and quantities
         ''')
 
-    # Welcome text
-    if st.session_state.level == 0 and st.session_state.last_feedback == '':
+    # Welcome text (only at start)
+    if level == 0 and st.session_state.get('last_feedback', '') == '':
         st.markdown('''
         ### Welcome to the Supply Chain Investigation Unit!
         As our newest data analyst, you'll be investigating a series of supply chain anomalies.
@@ -311,30 +373,32 @@ def show_student_view():
         ''')
 
     # Game over
-    if st.session_state.strikes >= 3:
+    if st.session_state.get('strikes', 0) >= 3:
         st.error('Game Over! Too many incorrect attempts.')
         if st.button('Start New Game', key='new_game_button'):
             reset_game_state(keep_auth=True)
         st.stop()
 
-    # Victory
-    if st.session_state.level >= len(st.session_state.scenes):
+    # ✅ Victory check BEFORE indexing into scenes
+    if level >= total_levels:
         st.balloons()
-        st.success(f'Congratulations! You solved the mystery with {st.session_state.score} points!')
+        st.success(f'🎉 Congratulations! You solved the mystery with {st.session_state.score} points!')
         if st.button('Play Again', key='play_again_final'):
             reset_game_state(keep_auth=True)
         st.stop()
 
-    # Display game state
+    # Safe to read the current scene now
+    scene = scenes[level]
+
+    # HUD
     col1, col2, col3 = st.columns(3)
     col1.metric('Score', st.session_state.score)
-    col2.metric('Level', st.session_state.level + 1)
+    col2.metric('Level', level + 1)
     col3.metric('Strikes', st.session_state.strikes)
 
-    # Current scene (once per render)
-    if 'last_render_count' not in st.session_state or st.session_state.last_render_count != st.session_state.render_count:
-        scene = st.session_state.scenes[st.session_state.level]
-        st.markdown(f'### Level {st.session_state.level + 1}: {scene["title"]}')
+    # Scene header/story: display-gated only
+    if st.session_state.get('last_render_count') != st.session_state.render_count:
+        st.markdown(f'### Level {level + 1}: {scene["title"]}')
         st.write(scene["story"])
         st.session_state.last_render_count = st.session_state.render_count
 
@@ -349,13 +413,9 @@ def show_student_view():
             placeholder='E.g., Show me all products with low inventory'
         )
         st.session_state.current_prompt = prompt
-        form_key = f'sql_form_{st.session_state.level}'
-        with st.form(key=form_key):
-            submit_button = st.form_submit_button(
-                'Generate SQL',
-                help='Click to generate SQL based on your description'
-            )
-            if submit_button:
+
+        with st.form(key=f'sql_form_{level}'):
+            if st.form_submit_button('Generate SQL', help='Click to generate SQL based on your description'):
                 if not prompt or not prompt.strip():
                     st.warning("Please enter a description of what you want to query")
                     st.session_state.generated_sql = "-- Please enter a description above and try again"
@@ -364,8 +424,7 @@ def show_student_view():
                     with st.spinner('Generating SQL...'):
                         try:
                             quality = get_random_quality()
-                            generated_sql = generate_sql(scene, quality, user_id=st.session_state.user_id)
-                            st.session_state.generated_sql = generated_sql
+                            st.session_state.generated_sql = generate_sql(scene, quality, user_id=st.session_state.user_id)
                             st.session_state.sql_quality = quality
                             st.session_state.current_prompt = prompt
                             st.session_state.last_render_count = st.session_state.render_count
@@ -376,6 +435,7 @@ def show_student_view():
 
         if 'generated_sql' not in st.session_state:
             st.session_state.generated_sql = "-- Enter a description and click 'Generate SQL' to get started"
+
     with col2:
         st.markdown('### Query Tips')
         st.markdown('''
@@ -385,56 +445,77 @@ def show_student_view():
         4. Think about the story
         ''')
 
+    # --- SQL editor state (initialize once) ---
+    sql_key = f"sql_input_{level}"
+    if sql_key not in st.session_state:
+        st.session_state[sql_key] = st.session_state.get("generated_sql", "")
+
     # Submit SQL
-    form_key = f'sql_form_level_{st.session_state.level}'
-    with st.form(key=form_key):
+    with st.form(key=f'sql_form_level_{level}'):
         st.markdown('**SQL Query:**')
-        if hasattr(st.session_state, 'last_sql_explanation') and st.session_state.last_sql_explanation:
+        if st.session_state.get('last_sql_explanation'):
             with st.expander("💡 Explanation", expanded=True):
                 st.markdown(st.session_state.last_sql_explanation)
 
-        sql_help = st.empty()
-        with sql_help.expander("💡 SQL Query Help", expanded=False):
+        with st.expander("💡 SQL Query Help", expanded=False):
             st.markdown('''
             - Modify the generated SQL or write your own query
             - Use the schema reference below for table and column names
             - Click "Submit SQL" when you're ready to test your query
             ''')
 
-        sql_input = st.text_area(
+        st.text_area(
             label='SQL Query',
-            value=st.session_state.generated_sql,
+            key=sql_key,
             height=150,
-            key=f'sql_input_{st.session_state.level}',
             label_visibility='collapsed'
         )
         submitted = st.form_submit_button('Submit SQL')
 
-        if submitted and f'sql_input_{st.session_state.level}' in st.session_state:
-            st.session_state.generated_sql = st.session_state[f'sql_input_{st.session_state.level}']
-
         if submitted:
-            if not sql_input or not sql_input.strip():
+            # Always read the *current* content from session state first
+            current_input = st.session_state.get(sql_key, "")
+            st.session_state.generated_sql = current_input            # keep UI echo in sync
+            st.session_state.current_sql_raw = current_input          # optional: for debugging
+
+            # Normalize once for both guard AND execution
+            _clean = _strip_comments_and_weirdness(current_input)
+            if not _clean:
                 st.error('⚠️ Please enter a SQL query first')
                 st.stop()
 
-            st.session_state.current_sql = sql_input
-            st.session_state.generated_sql = sql_input
+            _stmt = _first_statement(_clean)
+            st.session_state.current_sql = _stmt                      # store normalized single statement early
+
+            first_token = (_stmt.split(None, 1)[0].lower() if _stmt else "")
+            if first_token not in ("select", "with"):
+                st.error("Only read-only SELECT/CTE queries are allowed in this game.")
+                st.stop()
+
+            # Stable attempt token to avoid double-scoring/logging
+            token_hash = hashlib.sha1(_stmt.encode()).hexdigest()
+            attempt_token = f"{level}:{token_hash}"
 
             conn = get_connection()
             try:
-                # Evaluate
-                quality, result = evaluate_sql(conn, sql_input, scene['answer_sql'])
+                # Hard lock the connection to read-only and keep FKs on
+                conn.execute("PRAGMA foreign_keys=ON")
+                conn.execute("PRAGMA query_only=ON")
 
-                # LLM feedback text
-                feedback_text = ''
+                # Evaluate against reference using normalized statement
+                quality, result = evaluate_sql(conn, _stmt, scene['answer_sql'])
+
+                # Real scene id for logs (fixes 0% join)
+                current_scene_id = scene.get('id', level + 1)
+
+                # Feedback text
                 if quality == 'correct':
                     feedback_text = 'Great job! Your query returned the expected result.'
                 elif quality == 'partial':
                     feedback_text = 'Partially correct — compare your output to the expected columns/rows and refine joins/filters.'
                 elif quality == 'incorrect':
                     feedback_text = 'Not quite — double-check table names, join keys, and WHERE conditions.'
-                elif quality == 'syntax_error':
+                else:  # syntax_error
                     feedback_text = str(result)
 
                 if quality == 'syntax_error':
@@ -449,8 +530,6 @@ def show_student_view():
                         4. Check that parentheses and quotes are balanced
                         5. Verify JOIN conditions use existing columns
                         ''')
-                    # no log on syntax error
-
                 elif quality == 'correct':
                     st.session_state.last_result = result
                     st.success('🎉 Excellent work, detective! You found a crucial lead:')
@@ -458,16 +537,25 @@ def show_student_view():
                         st.write(feedback_text)
                     try:
                         if isinstance(result, pd.DataFrame):
-                            st.dataframe(result, width='stretch')
+                            st.dataframe(result, use_container_width=True)
                         else:
                             st.code(str(result))
                     except Exception:
                         st.write(result)
                     st.info(f'💡 Investigation Update: {scene["story"]}')
-                    st.session_state.score += 2
+
+                    if st.session_state.get('last_scored_attempt') != attempt_token:
+                        st.session_state.score += 2
+                        st.session_state.last_scored_attempt = attempt_token
+
                     st.session_state.last_feedback = 'advance'
-                    # Log attempt WITH feedback
-                    log_attempt(conn, st.session_state.user_id, st.session_state.level, sql_input, 2, feedback=feedback_text)
+
+                    # Log on a SEPARATE writable connection
+                    if st.session_state.get('last_logged_attempt') != attempt_token:
+                        with get_connection() as log_conn:
+                            log_conn.execute("PRAGMA foreign_keys=ON")
+                            log_attempt(log_conn, st.session_state.user_id, current_scene_id, _stmt, 2, feedback=feedback_text)
+                        st.session_state.last_logged_attempt = attempt_token
 
                 elif quality == 'partial':
                     st.warning('🤔 You\'re onto something, but the evidence is inconclusive...')
@@ -477,8 +565,12 @@ def show_student_view():
                     if isinstance(result, str):
                         st.code(result, language='sql')
                     st.session_state.last_feedback = 'retry'
-                    # Log attempt WITH feedback
-                    log_attempt(conn, st.session_state.user_id, st.session_state.level, sql_input, 1, feedback=feedback_text)
+
+                    if st.session_state.get('last_logged_attempt') != attempt_token:
+                        with get_connection() as log_conn:
+                            log_conn.execute("PRAGMA foreign_keys=ON")
+                            log_attempt(log_conn, st.session_state.user_id, current_scene_id, _stmt, 1, feedback=feedback_text)
+                        st.session_state.last_logged_attempt = attempt_token
 
                 else:  # incorrect
                     st.error('❌ This lead turned out to be a dead end.')
@@ -486,29 +578,26 @@ def show_student_view():
                         st.write(feedback_text)
                     st.session_state.strikes += 1
                     st.warning(f'⚠️ Investigation setback! ({st.session_state.strikes}/3 strikes)')
-                    # Log attempt WITH feedback
-                    log_attempt(conn, st.session_state.user_id, st.session_state.level, sql_input, 0, feedback=feedback_text)
+                    st.session_state.last_feedback = ''
+
+                    if st.session_state.get('last_logged_attempt') != attempt_token:
+                        with get_connection() as log_conn:
+                            log_conn.execute("PRAGMA foreign_keys=ON")
+                            log_attempt(log_conn, st.session_state.user_id, current_scene_id, _stmt, 0, feedback=feedback_text)
+                        st.session_state.last_logged_attempt = attempt_token
 
             except Exception as e:
                 st.error(f'An error occurred: {e}')
-                print(f"Error in SQL evaluation: {str(e)}")
             finally:
                 conn.close()
-                if not submitted or st.session_state.last_feedback != 'advance':
+                if st.session_state.get('last_feedback') != 'advance':
                     st.session_state.last_feedback = ''
 
-    # Victory check (again) and actions
-    if st.session_state.level >= len(st.session_state.scenes):
-        st.balloons()
-        st.success(f'🎉 Congratulations! You solved the mystery with {st.session_state.score} points!')
-        if st.button('Play Again', key='play_again_final'):
-            reset_game_state(keep_auth=True)
-        st.stop()
-
     # Progression
-    if st.session_state.last_feedback == 'advance':
-        if st.button('Next Level', key=f'next_level_button_{st.session_state.level}'):
-            st.session_state.level += 1
+    if st.session_state.get('last_feedback') == 'advance':
+        if st.button('Next Level', key=f'next_level_button_{level}'):
+            st.session_state.level = level + 1
+            # Clear states for next level
             st.session_state.generated_sql = ''
             st.session_state.current_sql = ''
             st.session_state.sql_quality = None
@@ -516,9 +605,14 @@ def show_student_view():
             st.session_state.current_prompt = ''
             st.session_state.last_result = None
             st.session_state.last_feedback = ''
+            st.session_state.last_scored_attempt = None
+            st.session_state.last_logged_attempt = None
             st.rerun()
 
-    st.progress((st.session_state.level) / 5)
+    # Progress bar (avoid div-by-zero)
+    progress_frac = level / max(1, total_levels)
+    progress_frac = max(0.0, min(1.0, float(progress_frac)))
+    st.progress(progress_frac)
     st.write(f"**Score:** {st.session_state.score} | **Strikes:** {st.session_state.strikes}")
 
 def verify_instructor_students(conn):
@@ -594,9 +688,10 @@ def show_instructor_view():
                 WHERE ins.instructor_id = ? AND l.score IS NOT NULL
             ''', (st.session_state.user_id,))
             avg_score = c.fetchone()[0] or 0
+            # Convert to percent scale (0/1/2 points -> 0%/50%/100%)
             st.metric("Total Students", total_students)
             st.metric("Total Attempts", total_attempts)
-            st.metric("Average Score", f"{avg_score:.1f}%")
+            st.metric("Average Score", f"{avg_score*50:.1f}%")
         except sqlite3.Error as e:
             st.error(f"Database error: {str(e)}")
         finally:
@@ -613,6 +708,7 @@ def show_instructor_view():
     conn = get_connection()
     try:
         c = conn.cursor()
+        # NOTE: scenes_attempted now counts ONLY valid scene IDs by joining scenes
         c.execute('''
             SELECT 
                 u.user_id,
@@ -621,7 +717,10 @@ def show_instructor_view():
                 (SELECT COUNT(*) FROM logs WHERE student_id = u.user_id) as total_attempts,
                 (SELECT MAX(timestamp) FROM logs WHERE student_id = u.user_id) as last_activity,
                 (SELECT AVG(CAST(score AS FLOAT)) FROM logs WHERE student_id = u.user_id) as avg_score,
-                (SELECT COUNT(DISTINCT scene_id) FROM logs WHERE student_id = u.user_id) as scenes_attempted,
+                (SELECT COUNT(DISTINCT l.scene_id)
+                   FROM logs l
+                   JOIN scenes s2 ON s2.id = l.scene_id
+                  WHERE l.student_id = u.user_id) as scenes_attempted,
                 (SELECT COUNT(DISTINCT id) FROM scenes) as total_scenes
             FROM users u
             JOIN instructor_students ins ON u.user_id = ins.student_id
@@ -638,8 +737,14 @@ def show_instructor_view():
             'ID', 'Username', 'Name', 'Attempts', 'Last Active', 
             'Avg Score', 'Scenes Attempted', 'Total Scenes'
         ])
-        df['Progress'] = (df['Scenes Attempted'] / df['Total Scenes'] * 100).round(1).astype(str) + '%'
-        df['Avg Score'] = df['Avg Score'].round(1).astype(str) + '%'
+        # Convert avg score to percent display (0/1/2 -> 0/50/100)
+        df['Scenes Attempted'] = df['Scenes Attempted'].astype(int)
+        df['Total Scenes'] = df['Total Scenes'].astype(int)
+        # Clamp progress to [0, 100]
+        safe_total = df['Total Scenes'].replace(0, 1)
+        progress_vals = (df['Scenes Attempted'] / safe_total).clip(0, 1) * 100
+        df['Progress'] = progress_vals.round(1).astype(str) + '%'
+        df['Avg Score'] = (df['Avg Score'] * 50).round(1).astype(str) + '%'
         st.dataframe(
             df[['Name', 'Username', 'Attempts', 'Avg Score', 'Progress', 'Last Active']],
             column_config={
@@ -651,7 +756,7 @@ def show_instructor_view():
                 'Last Active': 'Last Active'
             },
             hide_index=True,
-            width='stretch'
+            use_container_width=True
         )
         
         st.markdown("---")
@@ -682,28 +787,37 @@ def show_student_details(conn, student_id):
     username, full_name = student
     st.markdown(f"### {full_name} ({username})")
     
+    # Count only valid scenes (join to scenes) and clamp values in UI
     c.execute('''
         SELECT 
-            COUNT(DISTINCT scene_id) as scenes_attempted,
+            COUNT(DISTINCT CASE WHEN s.id IS NOT NULL THEN l.scene_id END) as scenes_attempted,
             (SELECT COUNT(*) FROM scenes) as total_scenes,
-            AVG(CAST(score AS FLOAT)) as avg_score,
+            AVG(CAST(l.score AS FLOAT)) as avg_score,
             COUNT(*) as total_attempts,
-            MIN(timestamp) as first_attempt,
-            MAX(timestamp) as last_attempt
-        FROM logs 
-        WHERE student_id = ?
+            MIN(l.timestamp) as first_attempt,
+            MAX(l.timestamp) as last_attempt
+        FROM logs l
+        LEFT JOIN scenes s ON s.id = l.scene_id
+        WHERE l.student_id = ?
     ''', (student_id,))
     progress = c.fetchone()
     
-    if progress and progress[0] > 0:
+    if progress and (progress[0] or 0) > 0:
         scenes_attempted, total_scenes, avg_score, total_attempts, first_attempt, last_attempt = progress
-        progress_percent = (scenes_attempted / total_scenes * 100) if total_scenes > 0 else 0
+
+        valid_total = max(0, int(total_scenes or 0))
+        valid_attempted = min(max(0, int(scenes_attempted or 0)), valid_total)
+
+        progress_frac = (valid_attempted / valid_total) if valid_total else 0.0
+        progress_frac = max(0.0, min(1.0, float(progress_frac)))
+        progress_percent = progress_frac * 100
+
         col1, col2, col3 = st.columns(3)
         with col1:
-            st.metric("Scenes Completed", f"{scenes_attempted} of {total_scenes}")
-            st.progress(progress_percent / 100, text=f"{progress_percent:.1f}%")
+            st.metric("Scenes Completed", f"{valid_attempted} of {valid_total}")
+            st.progress(progress_frac, text=f"{progress_percent:.1f}%")
         with col2:
-            st.metric("Average Score", f"{avg_score:.1f}%")
+            st.metric("Average Score", f"{(avg_score or 0)*50:.1f}%")  # convert to percent
         with col3:
             st.metric("Total Attempts", total_attempts)
         
@@ -725,9 +839,10 @@ def show_student_details(conn, student_id):
         if scene_progress:
             for scene in scene_progress:
                 scene_id, title, attempts, best_score, first_attempt, last_attempt = scene
-                with st.expander(f"{title} - {best_score if best_score is not None else '0'}%"):
+                display_best = int(best_score) * 50 if best_score is not None else 0
+                with st.expander(f"{title} - {display_best}%"):
                     if attempts > 0:
-                        st.metric("Best Score", f"{best_score}%")
+                        st.metric("Best Score", f"{display_best}%")
                         st.metric("Attempts", attempts)
                         st.caption(f"First attempt: {first_attempt}")
                         st.caption(f"Last attempt: {last_attempt}")
@@ -741,7 +856,7 @@ def show_student_details(conn, student_id):
                         for attempt in attempts_rows:
                             timestamp, score, hint_used, feedback = attempt
                             with st.container(border=True):
-                                st.write(f"**{timestamp}** - Score: {score}%")
+                                st.write(f"**{timestamp}** - Score: {int(score)*50}%")
                                 st.write(f"Hints used: {hint_used}")
                                 if feedback:
                                     with st.expander("View Feedback"):
