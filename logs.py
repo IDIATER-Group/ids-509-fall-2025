@@ -3,6 +3,17 @@ from datetime import datetime
 
 from db import get_connection
 
+def ensure_feedback_column(conn):
+    c = conn.cursor()
+    try:
+        c.execute("PRAGMA table_info(logs)")
+        cols = [row[1] for row in c.fetchall()]
+        if 'feedback' not in cols:
+            c.execute("ALTER TABLE logs ADD COLUMN feedback TEXT")
+            conn.commit()
+    except Exception as e:
+        print(f"[logs.migration] {e}")
+
 def ensure_logs_table(conn):
     """Ensure the logs table exists in the given connection"""
     c = conn.cursor()
@@ -14,14 +25,17 @@ def ensure_logs_table(conn):
         score TEXT,
         hint_used BOOLEAN DEFAULT 0,
         timestamp TEXT,
+        feedback TEXT,
         FOREIGN KEY (student_id) REFERENCES users(user_id) ON DELETE CASCADE
     )''')
     conn.commit()
+    # Still run migration to cover legacy DBs
+    ensure_feedback_column(conn)
 
 def setup_logs(conn):
     ensure_logs_table(conn)
 
-def log_attempt(conn, student_id, scene_id, attempt_sql, score, hint_used=False):
+def log_attempt(conn, student_id, scene_id, attempt_sql, score, hint_used=False, feedback=None):
     """Log a student's attempt at a scene
     
     Args:
@@ -34,9 +48,9 @@ def log_attempt(conn, student_id, scene_id, attempt_sql, score, hint_used=False)
     """
     c = conn.cursor()
     c.execute('''
-        INSERT INTO logs (student_id, scene_id, attempt_sql, score, hint_used, timestamp)
-        VALUES (?, ?, ?, ?, ?, datetime('now'))
-    ''', (student_id, scene_id, attempt_sql, score, 1 if hint_used else 0))
+        INSERT INTO logs (student_id, scene_id, attempt_sql, score, hint_used, timestamp, feedback)
+        VALUES (?, ?, ?, ?, ?, datetime('now'), ?)
+    ''', (student_id, scene_id, attempt_sql, score, 1 if hint_used else 0, feedback))
     conn.commit()
 
 def get_logs(conn, student_id=None, username=None, limit=None):

@@ -540,6 +540,17 @@ def show_student_view():
                 # Evaluate the SQL query
                 print(f"Evaluating SQL: {sql_input[:100]}...")
                 quality, result = evaluate_sql(conn, sql_input, scene['answer_sql'])
+                # Derive feedback text for logging and display
+                feedback_text = ''
+                if quality == 'correct':
+                    feedback_text = 'Great job! Your query returned the expected result.'
+                elif quality == 'partial':
+                    feedback_text = 'Partially correct — compare your output to the expected columns/rows and refine joins/filters.'
+                elif quality == 'incorrect':
+                    feedback_text = 'Not quite — double‑check table names, join keys, and WHERE conditions.'
+                elif quality == 'syntax_error':
+                    feedback_text = str(result)
+
                 print(f"Evaluation result - Quality: {quality}, Result type: {type(result)}")
                 
                 if quality == 'syntax_error':
@@ -560,6 +571,8 @@ def show_student_view():
                 elif quality == 'correct':
                     st.session_state.last_result = result
                     st.success('🎉 Excellent work, detective! You found a crucial lead:')
+                    with st.expander('LLM Feedback'):
+                        st.write(feedback_text)
                     # Show the query result in a clean format
                     try:
                         if isinstance(result, pd.DataFrame):
@@ -577,6 +590,8 @@ def show_student_view():
                 elif quality == 'partial':
                     st.warning('🤔 You\'re onto something, but the evidence is inconclusive...')
                     st.info('Your query revealed some information, but there might be more to uncover.')
+                    with st.expander('LLM Feedback'):
+                        st.write(feedback_text)
                     if isinstance(result, str):
                         st.code(result, language='sql')
                     st.session_state.last_feedback = 'retry'
@@ -585,6 +600,8 @@ def show_student_view():
                 
                 else:  # incorrect
                     st.error('❌ This lead turned out to be a dead end.')
+                    with st.expander('LLM Feedback'):
+                        st.write(feedback_text)
                     st.session_state.strikes += 1
                     st.warning(f'⚠️ Investigation setback! ({st.session_state.strikes}/3 strikes)')
                     # Log incorrect attempt
@@ -930,7 +947,7 @@ def show_student_details(conn, student_id):
                             timestamp, score, hint_used, feedback = attempt
                             with st.container(border=True):
                                 st.write(f"**{timestamp}** - Score: {score}%")
-                                st.write(f"Hints used: {hints_used}")
+                                st.write(f"Hints used: {hint_used}")
                                 if feedback:
                                     with st.expander("View Feedback"):
                                         st.write(feedback)
